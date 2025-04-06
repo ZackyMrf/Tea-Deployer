@@ -8,7 +8,6 @@ Tea-Testnet-Deployer is a CLI tool designed to simplify the process of deploying
 
 ## Key Features
 - 🛠️ Deploy ERC20 contracts with automatic verification.
-- 💸 Distribute native tokens (TEA) to verified addresses.
 - 🪙 Distribute ERC20 tokens to verified addresses.
 - 🔍 Integrated with the Tea Sepolia blockchain explorer.
 
