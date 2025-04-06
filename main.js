@@ -97,7 +97,7 @@ function updateEnv(key, value) {
 function readAddressKYC() {
   const filePath = 'address_KYC.txt';
   if (!fs.existsSync(filePath)) {
-    log("error", "❌ vaddress_KYC.txt not found.");
+    log("error", "❌ address_KYC.txt not found.");
     return [];
   }
 
@@ -111,6 +111,11 @@ function readAddressKYC() {
   }
 
   return addresses;
+}
+
+// Fungsi delay untuk menunggu 7 menit
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 async function sendERC20Token() {
@@ -142,6 +147,8 @@ async function sendERC20Token() {
   log("info", `🪙 Sending tokens to ${addresses.length} addresses...`);
   for (const recipient of addresses) {
     await sendToken(recipient, amountPerTx);
+    log("info", "⏳ Waiting for 7 minutes before the next transaction...");
+    await delay(7 * 60 * 1000); // Delay 7 menit
   }
 }
 
@@ -166,7 +173,7 @@ async function mainMenu() {
         message: 'Choose an option:',
         choices: [
           { name: '1. Deploy New Contract (Create ERC20 Token)', value: 'deploy' },
-          { name: '2. Send ERC20 Token to ed address KYC', value: 'sendERC20' },
+          { name: '2. Send ERC20 Token to verified addresses (KYC)', value: 'sendERC20' },
           { name: 'Exit', value: 'exit' }
         ]
       }
