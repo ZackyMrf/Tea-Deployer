@@ -7,7 +7,14 @@ import { exec } from 'child_process';
 import util from 'util';
 const execPromise = util.promisify(exec);
 
+// Validasi environment variables
+if (!process.env.MAIN_PRIVATE_KEY) {
+  console.error("❌ MAIN_PRIVATE_KEY is not defined in .env file.");
+  process.exit(1);
+}
+
 const rpcUrl = process.env.RPC_URL || "https://tea-sepolia.g.alchemy.com/public";
+let provider = null;
 const baseWallet = new ethers.Wallet(process.env.MAIN_PRIVATE_KEY);
 let contractInstance = null;
 let CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS || "";
@@ -21,8 +28,15 @@ function log(type, message) {
   console.log(logTypes[type] || message);
 }
 
+async function getProvider() {
+  if (!provider) {
+    provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+  }
+  return provider;
+}
+
 async function getWallet() {
-  const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
+  const provider = await getProvider();
   return baseWallet.connect(provider);
 }
 
@@ -42,7 +56,22 @@ async function compileContract() {
   }
 
   const artifact = JSON.parse(fs.readFileSync(artifactPath, "utf8"));
-  return { abi: artifact.abi, bytecode: artifact.bytecode.object || artifact.bytecode };
+  
+  if (!artifact.abi || !artifact.bytecode) {
+    throw new Error("❌ ABI or bytecode is invalid. Please recompile the contract.");
+  }
+  
+  // Log more details for debugging
+  log("info", `✅ ABI loaded with ${artifact.abi.length} methods`);
+  
+  // Ensure bytecode is properly structured
+  const bytecode = typeof artifact.bytecode === 'object' && artifact.bytecode.object 
+    ? artifact.bytecode.object 
+    : artifact.bytecode;
+    
+  log("info", `✅ Bytecode loaded (${bytecode.length} chars)`);
+
+  return { abi: artifact.abi, bytecode: bytecode };
 }
 
 async function deployContract() {
@@ -65,19 +94,68 @@ async function deployContract() {
 
   log("info", "🚀 Deploying contract...");
   const { abi, bytecode } = await compileContract();
+
+  // Validasi ABI dan Bytecode
+  if (!abi || !bytecode) {
+    throw new Error("❌ ABI or bytecode is invalid. Please recompile the contract.");
+  }
+
   const wallet = await getWallet();
-  const factory = new ethers.ContractFactory(abi, bytecode, wallet);
-  const totalSupplyInWei = ethers.utils.parseUnits(answers.totalSupply, Number(answers.decimals));
-  const contract = await factory.deploy(answers.name, answers.symbol, Number(answers.decimals), totalSupplyInWei);
+  log("info", `🔑 Using wallet: ${wallet.address}`);
 
-  log("info", `🚀 Tx Hash: ${contract.deployTransaction.hash}`);
-  log("info", "⏳ Waiting for confirmation...");
-  await contract.deployed();
+  try {
+    // Create factory with explicit parameters
+    const factory = new ethers.ContractFactory(
+      abi,
+      bytecode,
+      wallet
+    );
 
-  log("success", `🚀 Contract deployed at: ${contract.address}`);
-  CONTRACT_ADDRESS = contract.address;
-  contractInstance = contract;
-  updateEnv("CONTRACT_ADDRESS", contract.address);
+    // Log untuk memastikan ContractFactory berhasil dibuat
+    log("info", "✅ ContractFactory created successfully.");
+
+    // Hitung total supply dalam satuan wei
+    const totalSupplyInWei = ethers.utils.parseUnits(answers.totalSupply, Number(answers.decimals));
+
+    // Log parameter untuk debugging
+    log("info", `Deploying with parameters: name=${answers.name}, symbol=${answers.symbol}, decimals=${answers.decimals}, totalSupply=${totalSupplyInWei}`);
+
+    // Ambil gas price dari jaringan
+    const gasPrice = await wallet.provider.getGasPrice();
+    const adjustedGasPrice = gasPrice.mul(2); // Gandakan gas price untuk prioritas lebih tinggi
+
+    // Skip estimateGas and use fixed gas limit to avoid errors
+    log("info", "Deploying contract directly...");
+    const contract = await factory.deploy(
+      answers.name,
+      answers.symbol,
+      Number(answers.decimals),
+      totalSupplyInWei,
+      {
+        gasLimit: 5000000, // Use a safe fixed gas limit
+        maxFeePerGas: adjustedGasPrice,
+        maxPriorityFeePerGas: ethers.utils.parseUnits("9", "gwei")
+      }
+    );
+
+    log("info", `🚀 Tx Hash: ${contract.deployTransaction.hash}`);
+    log("info", "⏳ Waiting for confirmation...");
+
+    // Wait for transaction confirmation directly from deployment
+    const receipt = await contract.deployTransaction.wait();
+    
+    log("success", `🚀 Contract deployed at: ${contract.address}`);
+    CONTRACT_ADDRESS = contract.address;
+    contractInstance = contract;
+    updateEnv("CONTRACT_ADDRESS", contract.address);
+    return contract;
+  } catch (error) {
+    log("error", `❌ Failed to deploy contract: ${error.message}`);
+    if (error.stack) {
+      log("error", `Stack trace: ${error.stack.split('\n')[0]}`);
+    }
+    throw error;
+  }
 }
 
 function isValidNumber(input, errorMessage) {
@@ -141,27 +219,92 @@ async function sendERC20Token() {
   const tokenDecimals = await contractInstance.decimals();
   const amountPerTx = ethers.utils.parseUnits(answers.amountPerTx, tokenDecimals);
   const addresses = readAddressKYC();
+  await checkWalletBalance();
 
   if (addresses.length === 0) return;
 
   log("info", `🪙 Sending tokens to ${addresses.length} addresses...`);
-  for (const recipient of addresses) {
+  for (let i = 0; i < addresses.length; i++) {
+    const recipient = addresses[i];
+    log("info", `🚀 Sending to ${recipient} (${i + 1}/${addresses.length})`);
     await sendToken(recipient, amountPerTx);
     log("info", "⏳ Waiting for 7 minutes before the next transaction...");
     await delay(7 * 60 * 1000); // Delay 7 menit
   }
 }
 
+async function checkWalletBalance() {
+  const wallet = await getWallet();
+  const balance = await wallet.getBalance();
+  log("info", `💰 Wallet balance: ${ethers.utils.formatEther(balance)} TEA`);
+
+  if (balance.lt(ethers.utils.parseEther("0.01"))) {
+    throw new Error("Insufficient balance to cover gas fees.");
+  }
+}
+
 async function sendToken(recipient, amount) {
   try {
-    const tx = await contractInstance.transfer(recipient, amount);
+    const wallet = await getWallet();
+
+    // Ambil nonce terbaru dari jaringan
+    const nonce = await wallet.getTransactionCount("pending");
+
+    // Ambil gas price dari jaringan
+    const gasPrice = await contractInstance.provider.getGasPrice();
+
+    // Gandakan gas price untuk memastikan transaksi diterima
+    const adjustedGasPrice = gasPrice.mul(2);
+
+    // Estimasi gas limit untuk transaksi
+    const estimatedGasLimit = await contractInstance.estimateGas.transfer(recipient, amount);
+
+    // Kirim transaksi dengan gas fee dan nonce yang sesuai
+    const tx = await contractInstance.transfer(recipient, amount, {
+      gasLimit: estimatedGasLimit,
+      maxFeePerGas: adjustedGasPrice,
+      maxPriorityFeePerGas: ethers.utils.parseUnits("9", "gwei"),
+      nonce: nonce // Gunakan nonce yang benar
+    });
+
     log("info", `🪙 Tx Hash: ${tx.hash}`);
     log("info", "⏳ Waiting for confirmation...");
-    await tx.wait();
+
+    // Tunggu hingga transaksi selesai
+    await waitForTransaction(tx.hash);
+
     log("success", `🪙 Tokens sent to ${recipient}`);
   } catch (error) {
-    log("error", `❌ Failed to send tokens to ${recipient}: ${error.message}`);
+    if (error.message.includes("replacement transaction underpriced")) {
+      log("error", "❌ Replacement transaction underpriced. Retrying with higher gas fees...");
+      await sendToken(recipient, amount); // Kirim ulang transaksi
+    } else {
+      log("error", `❌ Failed to send tokens to ${recipient}: ${error.message}`);
+    }
   }
+}
+
+async function waitForTransaction(txHash) {
+  // Get provider directly instead of relying on contractInstance
+  const provider = await getProvider();
+
+  log("info", `⏳ Waiting for transaction ${txHash} to be mined...`);
+  let receipt = null;
+  const timeout = Date.now() + 1 * 60 * 1000; // 1 menit batas waktu
+
+  // Periksa status transaksi setiap 5 detik
+  while (!receipt) {
+    if (Date.now() > timeout) {
+      throw new Error(`Transaction ${txHash} is taking too long to be mined.`);
+    }
+    receipt = await provider.getTransactionReceipt(txHash);
+    if (!receipt) {
+      await delay(5000); // Tunggu 5 detik sebelum memeriksa lagi
+    }
+  }
+
+  log("success", `✅ Transaction ${txHash} confirmed.`);
+  return receipt;
 }
 
 async function mainMenu() {
